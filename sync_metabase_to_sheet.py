@@ -5,6 +5,9 @@ aggregation -> small summary tabs in Google Sheets.
 Raw rows are never written to Google Sheets (cell limit). Only the 4 aggregated tabs and
 Refresh_Log are written. Configuration comes from environment variables only.
 If any window fails to download or any validation fails, the sheet is left untouched.
+
+Adaptive windows: if a call hits the Cloudflare 100 s limit (HTTP 524), the window is split
+in half (down to 1 day) and the smaller size is remembered for that card.
 """
 import io
 import json
@@ -240,7 +243,9 @@ def blank_to_nan(df):
     return df
 
 
-def fetch_window(cfg, key, from_d, to_d, tag_ids):
+def fetch_window(cfg, key, from_d, to_d, tag_ids, retry_524=True):
+    """Download one card for one window. A 524 is retried once only if retry_524 is True
+    (i.e. the window cannot be split any further); otherwise CloudflareTimeout is raised."""
     spec = CARDS[key]
     card_id = cfg[spec["env"]]
     url = f"{cfg['METABASE_URL']}/api/card/{card_id}/query/csv"
@@ -303,12 +308,16 @@ def fetch_window(cfg, key, from_d, to_d, tag_ids):
             log.error("%s failed (not retryable): %s", what, exc)
             raise
         except CloudflareTimeout as exc:
-            log.warning("Cloudflare 100 s limit: set CHUNK_DAYS smaller (for example 7)")
-            limit, err = 1, exc
+            if retry_524:
+                log.warning("Cloudflare 100 s limit: set CHUNK_DAYS smaller (for example 7)")
+            else:
+                log.warning("%s hit the Cloudflare 100 s limit; the window will be split.", what)
+            limit, err = (1 if retry_524 else 0), exc
         except Exception as exc:  # noqa: BLE001
             limit, err = FETCH_MAX_RETRIES, exc
         if attempt >= limit:
-            log.error("%s failed after %d retries: %s", what, attempt, err)
+            if retry_524 or not isinstance(err, CloudflareTimeout):
+                log.error("%s failed after %d retries: %s", what, attempt, err)
             raise err
         delay = FETCH_BASE_DELAY_S * (2 ** attempt)
         attempt += 1
@@ -320,6 +329,35 @@ def fetch_window(cfg, key, from_d, to_d, tag_ids):
         log.error("%s: required columns missing from Metabase result: %s", key, missing)
         sys.exit(3)
     return blank_to_nan(df[spec["columns"]].copy())
+
+
+def fetch_range(cfg, key, from_d, to_d, tag_ids, caps):
+    """Fetch one card for [from_d, to_d). On a 524 the range is split into smaller pieces
+    (cap = half the failed size, down to 1 day) and the cap is remembered for this card."""
+    days = (to_d - from_d).days
+    cap = caps.get(key)
+    if cap and days > cap:
+        parts = []
+        d = from_d
+        while d < to_d:
+            e = min(d + timedelta(days=cap), to_d)
+            parts.append(fetch_range(cfg, key, d, e, tag_ids, caps))
+            d = e
+        return pd.concat(parts, ignore_index=True)
+
+    t0 = time.time()
+    try:
+        part = fetch_window(cfg, key, from_d, to_d, tag_ids, retry_524=(days <= 1))
+    except CloudflareTimeout:
+        if days <= 1:
+            raise
+        caps[key] = max(1, days // 2)
+        log.warning("%s: using windows of at most %d day(s) from now on.", key, caps[key])
+        return fetch_range(cfg, key, from_d, to_d, tag_ids, caps)
+
+    log.info("Window %s -> %s | %-8s %s rows in %.1f s",
+             from_d, to_d, key, f"{len(part):,}", time.time() - t0)
+    return part
 
 
 def dedupe_keep_last(df, subset, name):
@@ -344,20 +382,20 @@ def fetch_all(cfg):
 
     tag_ids = {key: get_tag_ids(cfg, cfg[spec["env"]]) for key, spec in CARDS.items()}
     frames = {key: [] for key in CARDS}
+    caps = {}  # learned max window size (days) per card after a 524
     for from_d, to_d in windows:
         for key in CARDS:
-            t0 = time.time()
             try:
-                part = fetch_window(cfg, key, from_d, to_d, tag_ids[key])
+                part = fetch_range(cfg, key, from_d, to_d, tag_ids[key], caps)
             except SystemExit:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.error("Window %s -> %s, card %s could not be fetched (%s). Aborting; sheet untouched.",
                           from_d, to_d, key, exc)
                 sys.exit(4)
-            log.info("Window %s -> %s | %-8s %s rows in %.1f s",
-                     from_d, to_d, key, f"{len(part):,}", time.time() - t0)
             frames[key].append(part)
+    if caps:
+        log.info("Learned window caps (days): %s", caps)
 
     # A later window's row wins (a lead's latest record).
     leads_raw = dedupe_keep_last(pd.concat(frames["LEADS"], ignore_index=True), ["Lead ID"], "LEADS")
