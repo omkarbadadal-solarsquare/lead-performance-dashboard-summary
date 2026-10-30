@@ -92,12 +92,19 @@ UNMAPPED_LABEL = "UNMAPPED - REVIEW"
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
+class FatalFetchError(RuntimeError):
+    """Client-side error (HTTP 4xx): retrying cannot help."""
+
+
 def with_retries(fn, what, retries, base_delay):
     """Run fn(); on failure retry up to `retries` times with exponential backoff."""
     attempt = 0
     while True:
         try:
             return fn()
+        except FatalFetchError as exc:
+            log.error("%s failed (not retryable): %s", what, exc)
+            raise
         except Exception as exc:  # noqa: BLE001
             if attempt >= retries:
                 log.error("%s failed after %d retries: %s", what, retries, exc)
@@ -162,15 +169,44 @@ def short_error_text(resp):
     return text[:300]
 
 
+def get_tag_ids(cfg):
+    """Read the real template-tag ids of the saved question (falls back to the tag name)."""
+    url = f"{cfg['METABASE_URL']}/api/card/{cfg['METABASE_CARD_ID']}"
+    ids = {"from_date": "from_date", "to_date": "to_date"}
+    try:
+        resp = requests.get(url, headers={"x-api-key": cfg["METABASE_API_KEY"]}, timeout=60)
+        if resp.status_code != 200:
+            log.warning("Could not read card definition (HTTP %s); using tag names as ids.", resp.status_code)
+            return ids
+        tags = resp.json()["dataset_query"]["native"]["template-tags"]
+        for name in ids:
+            if name not in tags:
+                log.error(
+                    "Template tag '%s' not found in question %s. Found tags: %s",
+                    name, cfg["METABASE_CARD_ID"], sorted(tags),
+                )
+                sys.exit(7)
+            ids[name] = tags[name].get("id") or name
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not parse card definition (%s); using tag names as ids.", exc)
+    log.info("Template tag ids: %s", ids)
+    return ids
+
+
 def fetch_month(cfg, from_date, to_date):
     url = f"{cfg['METABASE_URL']}/api/card/{cfg['METABASE_CARD_ID']}/query/csv"
+    tag_ids = cfg["TAG_IDS"]
     parameters = [
         {
+            "id": tag_ids["from_date"],
             "type": "date/single",
             "value": from_date.strftime("%Y-%m-%d"),
             "target": ["variable", ["template-tag", "from_date"]],
         },
         {
+            "id": tag_ids["to_date"],
             "type": "date/single",
             "value": to_date.strftime("%Y-%m-%d"),
             "target": ["variable", ["template-tag", "to_date"]],
@@ -187,7 +223,10 @@ def fetch_month(cfg, from_date, to_date):
             timeout=REQUEST_TIMEOUT_S,
         ) as resp:
             if resp.status_code != 200:
-                raise RuntimeError(f"Metabase returned HTTP {resp.status_code}: {short_error_text(resp)}")
+                msg = f"Metabase returned HTTP {resp.status_code}: {short_error_text(resp)}"
+                if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    raise FatalFetchError(msg)
+                raise RuntimeError(msg)
             resp.raw.decode_content = True
             return pd.read_csv(
                 resp.raw,
@@ -210,6 +249,7 @@ def fetch_month(cfg, from_date, to_date):
 
 def fetch_all(cfg):
     start = parse_start_month(cfg["START_MONTH"])
+    cfg["TAG_IDS"] = get_tag_ids(cfg)
     today = datetime.now(IST).date()
     frames = []
     for from_date, to_date in month_windows(start, today):
