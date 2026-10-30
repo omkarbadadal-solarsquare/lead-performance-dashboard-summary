@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Daily pipeline: Metabase saved question -> pandas aggregation -> small summary tabs in Google Sheets.
+"""Daily pipeline: Metabase saved SQL question (month by month) -> pandas aggregation
+-> small summary tabs in Google Sheets.
 
-Raw rows are never written to Google Sheets (cell limit). Only aggregated tabs + Refresh_Log are written.
-Configuration comes from environment variables only.
+Raw rows are never written to Google Sheets (cell limit). Only the 4 aggregated tabs
+and Refresh_Log are written. Configuration comes from environment variables only.
+If any month fails to download or any validation fails, the sheet is left untouched.
 """
 import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -30,12 +32,15 @@ log = logging.getLogger("metabase_sync")
 # ----------------------------------------------------------------------------
 SCORE_BANDS = [0, 40, 70]  # PLACEHOLDER - edit to real bands
 
-REQUEST_TIMEOUT_S = 1200
+IST = ZoneInfo("Asia/Kolkata")
+DEFAULT_START_MONTH = "2026-03-01"
+
+REQUEST_TIMEOUT_S = 600
 FETCH_RETRIES = 3
+FETCH_BASE_DELAY_S = 15
 WRITE_RETRIES = 3
+WRITE_BASE_DELAY_S = 5
 WRITE_CHUNK_ROWS = 5000
-# Safety guard: summary tabs are meant to be SMALL. Google Sheets allows 10M cells per spreadsheet.
-MAX_TOTAL_CELLS = 5_000_000
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -99,9 +104,7 @@ def with_retries(fn, what, retries, base_delay):
                 raise
             delay = base_delay * (2 ** attempt)
             attempt += 1
-            log.warning(
-                "%s failed (%s). Retry %d/%d in %ds.", what, exc, attempt, retries, delay
-            )
+            log.warning("%s failed (%s). Retry %d/%d in %ds.", what, exc, attempt, retries, delay)
             time.sleep(delay)
 
 
@@ -119,29 +122,72 @@ def read_config():
         log.error("Missing environment variables: %s", missing)
         sys.exit(2)
     cfg["METABASE_URL"] = cfg["METABASE_URL"].rstrip("/")
+    cfg["START_MONTH"] = os.environ.get("START_MONTH", "").strip() or DEFAULT_START_MONTH
     return cfg
 
 
+def parse_start_month(text):
+    for fmt in ("%Y-%m-%d", "%Y-%m"):
+        try:
+            return datetime.strptime(text, fmt).date().replace(day=1)
+        except ValueError:
+            continue
+    log.error("START_MONTH '%s' is not valid. Use YYYY-MM-DD or YYYY-MM.", text)
+    sys.exit(2)
+
+
+def next_month(d):
+    return date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+
+
+def month_windows(start, today):
+    """Yield (from_date inclusive, to_date exclusive) for every month start..current month."""
+    current = date(today.year, today.month, 1)
+    if start > current:
+        log.error("START_MONTH %s is after the current month %s.", start, current)
+        sys.exit(2)
+    d = start
+    while d <= current:
+        yield d, next_month(d)
+        d = next_month(d)
+
+
 # ----------------------------------------------------------------------------
-# Fetch
+# Fetch (month by month)
 # ----------------------------------------------------------------------------
-def fetch_dataframe(cfg):
+def short_error_text(resp):
+    if resp.status_code == 524:
+        return "Cloudflare timeout (524): this month's query took longer than ~100 s"
+    text = " ".join(resp.text.split())
+    return text[:300]
+
+
+def fetch_month(cfg, from_date, to_date):
     url = f"{cfg['METABASE_URL']}/api/card/{cfg['METABASE_CARD_ID']}/query/csv"
+    parameters = [
+        {
+            "type": "date/single",
+            "value": from_date.strftime("%Y-%m-%d"),
+            "target": ["variable", ["template-tag", "from_date"]],
+        },
+        {
+            "type": "date/single",
+            "value": to_date.strftime("%Y-%m-%d"),
+            "target": ["variable", ["template-tag", "to_date"]],
+        },
+    ]
     needed = set(NEEDED_COLUMNS)
 
     def _once():
-        log.info("POST %s (streaming, timeout %ss)", url, REQUEST_TIMEOUT_S)
         with requests.post(
             url,
             headers={"x-api-key": cfg["METABASE_API_KEY"]},
-            data={"format_rows": "false"},
+            data={"format_rows": "false", "parameters": json.dumps(parameters)},
             stream=True,
             timeout=REQUEST_TIMEOUT_S,
         ) as resp:
             if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Metabase returned HTTP {resp.status_code}: {resp.text[:500]}"
-                )
+                raise RuntimeError(f"Metabase returned HTTP {resp.status_code}: {short_error_text(resp)}")
             resp.raw.decode_content = True
             return pd.read_csv(
                 resp.raw,
@@ -152,13 +198,40 @@ def fetch_dataframe(cfg):
                 encoding="utf-8-sig",
             )
 
-    df = with_retries(_once, "Metabase fetch", FETCH_RETRIES, base_delay=15)
+    label = from_date.strftime("%Y-%m")
+    df = with_retries(_once, f"Metabase fetch {label}", FETCH_RETRIES, FETCH_BASE_DELAY_S)
 
     missing = [c for c in NEEDED_COLUMNS if c not in df.columns]
     if missing:
-        log.error("Required columns missing from Metabase result: %s", missing)
+        log.error("Month %s: required columns missing from Metabase result: %s", label, missing)
         sys.exit(3)
-    return df[NEEDED_COLUMNS].copy()
+    return df[NEEDED_COLUMNS]
+
+
+def fetch_all(cfg):
+    start = parse_start_month(cfg["START_MONTH"])
+    today = datetime.now(IST).date()
+    frames = []
+    for from_date, to_date in month_windows(start, today):
+        label = from_date.strftime("%Y-%m")
+        t0 = time.time()
+        try:
+            part = fetch_month(cfg, from_date, to_date)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("Month %s could not be fetched (%s). Aborting; sheet untouched.", label, exc)
+            sys.exit(4)
+        log.info("Month %s: %s rows in %.1f s", label, f"{len(part):,}", time.time() - t0)
+        frames.append(part)
+
+    df = pd.concat(frames, ignore_index=True)
+    before = len(df)
+    # Safety net: a lead belongs to exactly one creation month.
+    df = df.drop_duplicates(["Lead ID", "MS Instance Key"], keep="first").reset_index(drop=True)
+    if len(df) != before:
+        log.warning("Dropped %s duplicate (Lead ID, MS Instance Key) rows.", f"{before - len(df):,}")
+    return df
 
 
 # ----------------------------------------------------------------------------
@@ -195,11 +268,9 @@ def score_band_labels():
 
 def add_score_band(df):
     bins = list(SCORE_BANDS) + [np.inf]
-    band = pd.cut(
-        df["Heuristic Score"], bins=bins, labels=score_band_labels(), right=False
-    ).astype(object)
+    band = pd.cut(df["Heuristic Score"], bins=bins, labels=score_band_labels(), right=False).astype(object)
     unscored = (df["Score Status"] == "Unscored") | df["Heuristic Score"].isna()
-    # Scores below the first lower bound also fall out of pd.cut as NaN -> treated as Unscored
+    # Scores below the first lower bound fall out of pd.cut as NaN -> also "Unscored"
     df["Score Band"] = band.where(~unscored & band.notna(), "Unscored")
     return df
 
@@ -220,16 +291,7 @@ def ms_to_md_band(days):
         days == 5,
         days >= 6,
     ]
-    choices = [
-        "Not done",
-        "Same day",
-        "D+1",
-        "D+2",
-        "D+3",
-        "D+4",
-        "D+5",
-        "D+6 and above",
-    ]
+    choices = ["Not done", "Same day", "D+1", "D+2", "D+3", "D+4", "D+5", "D+6 and above"]
     return pd.Series(np.select(conditions, choices, default="Not done"), index=days.index)
 
 
@@ -238,10 +300,20 @@ def ms_to_md_band(days):
 # ----------------------------------------------------------------------------
 def count_table(frame, group_cols, metric_name):
     return (
-        frame.groupby(group_cols, as_index=False, sort=True)
+        frame.groupby(group_cols, as_index=False, sort=True, dropna=False)
         .size()
         .rename(columns={"size": metric_name})
     )
+
+
+def tidy_numbers(table):
+    """Store whole-valued float columns as integers so they are written as clean numbers."""
+    for c in table.columns:
+        if pd.api.types.is_float_dtype(table[c]):
+            vals = table[c].dropna()
+            if (vals % 1 == 0).all():
+                table[c] = table[c].fillna(0).astype("int64")
+    return table
 
 
 def build_tables(leads, inst):
@@ -263,7 +335,7 @@ def build_tables(leads, inst):
     ms_md = count_table(inst, DIMS + ["Day Type", "MS to MD Band"], "MS Instances")
 
     # 4. Agg_Slot
-    slot = inst.groupby(DIMS + ["MS Slot", "Day Type"], as_index=False, sort=True).agg(
+    slot = inst.groupby(DIMS + ["MS Slot", "Day Type"], as_index=False, sort=True, dropna=False).agg(
         **{
             "All MS": ("Schedule Records on MS Date", "sum"),
             "Unique MS": ("MS Instance Key", "size"),
@@ -282,41 +354,26 @@ def build_tables(leads, inst):
     return {name: tidy_numbers(t) for name, t in tables.items()}
 
 
-def tidy_numbers(table):
-    """Store whole-valued float columns as integers so they are written as clean numbers."""
-    for c in table.columns:
-        if pd.api.types.is_float_dtype(table[c]):
-            vals = table[c].dropna()
-            if (vals % 1 == 0).all():
-                table[c] = table[c].fillna(0).astype("int64")
-    return table
-
-
 # ----------------------------------------------------------------------------
 # Validation
 # ----------------------------------------------------------------------------
 def validate(df, leads, inst, tables):
     n_leads, n_inst = len(leads), len(inst)
+    ageing = tables["Agg_Ageing"]
     totals = {
         "raw rows": len(df),
         "distinct leads": n_leads,
         "MS instances": n_inst,
         "Agg_Score_Disp Leads": int(tables["Agg_Score_Disp"]["Leads"].sum()),
-        "Agg_Ageing Leads (MS)": int(
-            tables["Agg_Ageing"].loc[tables["Agg_Ageing"]["Measure"] == "MS", "Leads"].sum()
-        ),
-        "Agg_Ageing Leads (MD)": int(
-            tables["Agg_Ageing"].loc[tables["Agg_Ageing"]["Measure"] == "MD", "Leads"].sum()
-        ),
+        "Agg_Ageing Leads (MS)": int(ageing.loc[ageing["Measure"] == "MS", "Leads"].sum()),
+        "Agg_Ageing Leads (MD)": int(ageing.loc[ageing["Measure"] == "MD", "Leads"].sum()),
         "Agg_MS_MD MS Instances": int(tables["Agg_MS_MD"]["MS Instances"].sum()),
         "Agg_Slot Unique MS": int(tables["Agg_Slot"]["Unique MS"].sum()),
     }
-    total_cells = sum(t.shape[0] * t.shape[1] for t in tables.values())
-    totals["total cells to write"] = total_cells
 
     log.info("Validation totals:")
     for k, v in totals.items():
-        log.info("  %-28s %s", k, f"{v:,}")
+        log.info("  %-26s %s", k, f"{v:,}")
         print(f"VALIDATION {k}: {v}")
 
     failures = []
@@ -332,11 +389,6 @@ def validate(df, leads, inst, tables):
         failures.append("sum(Agg_MS_MD MS Instances) != len(inst)")
     if totals["Agg_Slot Unique MS"] != n_inst:
         failures.append("sum(Agg_Slot Unique MS) != len(inst)")
-    if total_cells > MAX_TOTAL_CELLS:
-        failures.append(
-            f"summary tabs too large ({total_cells:,} cells > {MAX_TOTAL_CELLS:,}); "
-            "check dimension cardinality"
-        )
 
     if failures:
         for f in failures:
@@ -362,6 +414,22 @@ def frame_to_values(table):
     return [list(table.columns)] + rows
 
 
+def open_spreadsheet(cfg):
+    try:
+        info = json.loads(cfg["GCP_SERVICE_ACCOUNT_JSON"])
+    except json.JSONDecodeError as exc:
+        log.error("GCP_SERVICE_ACCOUNT_JSON is not valid JSON: %s", exc)
+        sys.exit(5)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    return with_retries(
+        lambda: client.open_by_key(cfg["SPREADSHEET_ID"]),
+        "open spreadsheet",
+        WRITE_RETRIES,
+        WRITE_BASE_DELAY_S,
+    )
+
+
 def write_tab(spreadsheet, name, values):
     try:
         ws = spreadsheet.worksheet(name)
@@ -373,12 +441,12 @@ def write_tab(spreadsheet, name, values):
     n_rows = max(len(values), 1)
     n_cols = max(max((len(r) for r in values), default=1), 1)
 
-    with_retries(ws.clear, f"clear {name}", WRITE_RETRIES, base_delay=5)
+    with_retries(ws.clear, f"clear {name}", WRITE_RETRIES, WRITE_BASE_DELAY_S)
     with_retries(
         lambda: ws.resize(rows=n_rows, cols=n_cols),
         f"resize {name}",
         WRITE_RETRIES,
-        base_delay=5,
+        WRITE_BASE_DELAY_S,
     )
 
     for start in range(0, len(values), WRITE_CHUNK_ROWS):
@@ -391,34 +459,22 @@ def write_tab(spreadsheet, name, values):
             ),
             f"write {name} rows {start + 1}-{start + len(chunk)}",
             WRITE_RETRIES,
-            base_delay=5,
+            WRITE_BASE_DELAY_S,
         )
     log.info("Wrote tab '%s': %d rows x %d cols.", name, len(values), n_cols)
-
-
-def open_spreadsheet(cfg):
-    info = json.loads(cfg["GCP_SERVICE_ACCOUNT_JSON"])
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    client = gspread.authorize(creds)
-    return with_retries(
-        lambda: client.open_by_key(cfg["SPREADSHEET_ID"]),
-        "open spreadsheet",
-        WRITE_RETRIES,
-        base_delay=5,
-    )
 
 
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-def main():
+def run():
     cfg = read_config()
 
-    log.info("Step 1/5: fetching data from Metabase")
-    df = fetch_dataframe(cfg)
-    log.info("Fetched %s rows x %d columns.", f"{len(df):,}", df.shape[1])
+    log.info("Step 1/5: fetching data from Metabase month by month (from %s)", cfg["START_MONTH"])
+    df = fetch_all(cfg)
+    log.info("Fetched %s rows x %d columns in total.", f"{len(df):,}", df.shape[1])
     if len(df) == 0:
-        log.error("VALIDATION FAILED: raw rows must be > 0. Aborting.")
+        log.error("VALIDATION FAILED: raw rows must be > 0. Aborting; sheet untouched.")
         sys.exit(1)
 
     log.info("Step 2/5: cleaning and computing bands")
@@ -441,15 +497,12 @@ def main():
     validate(df, leads, inst, tables)
 
     refresh_log = [
-        ["Last refreshed (IST)", datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")],
+        ["Last refreshed (IST)", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")],
         ["Raw rows", int(len(df))],
         ["Distinct leads", int(len(leads))],
         ["MS instances", int(len(inst))],
         ["Unmapped Bucket 2.0 leads", int((leads["Bucket 2.0"] == UNMAPPED_LABEL).sum())],
-        [
-            "MD before schedule check rows",
-            int((inst["MD Before Schedule Data Check"] == 1).sum()),
-        ],
+        ["MD before schedule check rows", int((inst["MD Before Schedule Data Check"] == 1).sum())],
         ["Unscored leads", int((leads["Score Band"] == "Unscored").sum())],
     ]
 
@@ -460,6 +513,19 @@ def main():
     write_tab(spreadsheet, "Refresh_Log", refresh_log)
 
     log.info("Done. Refresh_Log: %s", {k: v for k, v in refresh_log})
+
+
+def main():
+    try:
+        run()
+    except SystemExit:
+        raise
+    except gspread.exceptions.APIError as exc:
+        log.error("Google Sheets API error: %s", exc)
+        sys.exit(6)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Unexpected failure: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
