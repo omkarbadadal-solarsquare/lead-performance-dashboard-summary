@@ -274,10 +274,13 @@ def fetch_window(cfg, key, from_d, to_d, tag_ids):
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
                     raise FatalFetchError(msg)
                 raise RuntimeError(msg)
-            resp.raw.decode_content = True
+                        buf = io.BytesIO()
+            for block in resp.iter_content(chunk_size=1 << 20):
+                buf.write(block)
+            buf.seek(0)
             try:
                 return pd.read_csv(
-                    resp.raw,
+                    buf,
                     dtype=str,
                     usecols=lambda c: c in needed,  # memory-safe: only this card's columns
                     keep_default_na=False,
