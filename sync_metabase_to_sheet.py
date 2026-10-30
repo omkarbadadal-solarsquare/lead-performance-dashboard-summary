@@ -6,6 +6,7 @@ Raw rows are never written to Google Sheets (cell limit). Only the 4 aggregated 
 Refresh_Log are written. Configuration comes from environment variables only.
 If any window fails to download or any validation fails, the sheet is left untouched.
 """
+import io
 import json
 import logging
 import os
@@ -274,21 +275,23 @@ def fetch_window(cfg, key, from_d, to_d, tag_ids):
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
                     raise FatalFetchError(msg)
                 raise RuntimeError(msg)
-                        buf = io.BytesIO()
+            # Download the body in 1 MB blocks. A dropped connection raises a clear
+            # network error here instead of a confusing "I/O operation on closed file".
+            buf = io.BytesIO()
             for block in resp.iter_content(chunk_size=1 << 20):
                 buf.write(block)
-            buf.seek(0)
-            try:
-                return pd.read_csv(
-                    buf,
-                    dtype=str,
-                    usecols=lambda c: c in needed,  # memory-safe: only this card's columns
-                    keep_default_na=False,
-                    na_values=[""],
-                    encoding="utf-8-sig",
-                )
-            except pd.errors.EmptyDataError:
-                return pd.DataFrame(columns=spec["columns"], dtype=str)
+        buf.seek(0)
+        try:
+            return pd.read_csv(
+                buf,
+                dtype=str,
+                usecols=lambda c: c in needed,  # memory-safe: only this card's columns
+                keep_default_na=False,
+                na_values=[""],
+                encoding="utf-8-sig",
+            )
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame(columns=spec["columns"], dtype=str)
 
     what = f"{key} {from_d} -> {to_d}"
     attempt = 0
