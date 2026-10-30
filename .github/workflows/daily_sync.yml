@@ -1,0 +1,37 @@
+name: Daily Metabase to Sheet sync
+
+on:
+  schedule:
+    # 07:00 AM IST because GitHub cron is UTC
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-metabase-sheet-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        run: python sync_metabase_to_sheet.py
+        env:
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          METABASE_CARD_ID: ${{ secrets.METABASE_CARD_ID }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
